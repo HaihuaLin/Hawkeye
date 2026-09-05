@@ -168,6 +168,33 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device to use ('cuda' or 'cpu')")
     args = parser.parse_args()
 
+    # 1. Smart model path auto-detection
+    if not os.path.exists(args.model_path):
+        candidates = [
+            "./Model Zoo", "../Model Zoo",
+            "./model_zoo", "../model_zoo",
+            "./checkpoints/Hawkeye", "./output_folder/Hawkeye",
+            "../checkpoints/Hawkeye", "../output_folder/Hawkeye"
+        ]
+        for c in candidates:
+            if os.path.exists(c) and (os.path.exists(os.path.join(c, "adapter_config.json")) or os.path.exists(os.path.join(c, "config.json"))):
+                args.model_path = c
+                break
+
+    # 2. Smart video path auto-detection
+    if not os.path.exists(args.video):
+        vid_candidates = [
+            os.path.join("..", args.video),
+            os.path.join(".", args.video),
+            os.path.join("..", "Anomaly-Videos-Part-1", args.video),
+            os.path.join(".", "Anomaly-Videos-Part-1", args.video),
+            os.path.join("..", "Anomaly-Videos-Part-1", "Abuse", args.video)
+        ]
+        for vc in vid_candidates:
+            if os.path.exists(vc):
+                args.video = vc
+                break
+
     if not os.path.exists(args.video):
         print(f"Error: Video file not found: {args.video}")
         sys.exit(1)

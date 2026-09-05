@@ -46,3 +46,15 @@ temp_clips/
 # Temporary weights / caches (keep checkpoints/Video-LLaVA-Pretrain-7B)
 checkpoints/*
 !checkpoints/Video-LLaVA-Pretrain-7B
+
+# Data & Large Weights (Keep repo lightweight)
+Model Zoo/
+model_zoo/
+Anomaly-Videos-Part-1/
+data/
+videos/
+*.zip
+*.tar*
+*.mp4
+*.avi
+
