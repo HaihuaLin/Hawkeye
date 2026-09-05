@@ -195,6 +195,21 @@ def main():
                 args.video = vc
                 break
 
+    # 3. Smart model_base auto-detection
+    if args.model_base == "lmsys/vicuna-7b-v1.5":
+        base_candidates = [
+            "/mnt/workspace/vicuna-7b-v1.5",
+            "../vicuna-7b-v1.5",
+            "./vicuna-7b-v1.5",
+            "/mnt/workspace/lmsys/vicuna-7b-v1.5",
+            "../lmsys/vicuna-7b-v1.5",
+            "./lmsys/vicuna-7b-v1.5"
+        ]
+        for bc in base_candidates:
+            if os.path.exists(bc) and (os.path.exists(os.path.join(bc, "config.json")) or os.path.exists(os.path.join(bc, "tokenizer_config.json"))):
+                args.model_base = bc
+                break
+
     if not os.path.exists(args.video):
         print(f"Error: Video file not found: {args.video}")
         sys.exit(1)
