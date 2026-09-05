@@ -2,6 +2,14 @@ import os
 import sys
 import argparse
 import tempfile
+
+# Compatibility patch for pytorchvideo with torchvision >= 0.18
+try:
+    import torchvision.transforms.functional as _F
+    sys.modules["torchvision.transforms.functional_tensor"] = _F
+except Exception:
+    pass
+
 import torch
 import numpy as np
 from tqdm import tqdm

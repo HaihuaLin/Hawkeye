@@ -9,6 +9,12 @@ from PIL import Image
 from torchvision import transforms
 from transformers import ProcessorMixin, BatchEncoding
 from transformers.image_processing_utils import BatchFeature
+import sys
+try:
+    import torchvision.transforms.functional as _F
+    sys.modules["torchvision.transforms.functional_tensor"] = _F
+except Exception:
+    pass
 from pytorchvideo.data.encoded_video import EncodedVideo
 from torchvision.transforms import Compose, Lambda, ToTensor
 from torchvision.transforms._transforms_video import NormalizeVideo, RandomCropVideo, RandomHorizontalFlipVideo, CenterCropVideo
