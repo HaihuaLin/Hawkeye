@@ -37,6 +37,12 @@ import copy
 from llava.constants import IGNORE_INDEX, X_TOKEN_INDEX, DEFAULT_X_PATCH_TOKEN, DEFAULT_X_START_TOKEN, \
     DEFAULT_X_END_TOKEN
 
+# =========================================================================================================
+# Hawkeye 论文方法映射：第 3.1 节 图结构场景建模模块 (Graph-structured Scene Modeling Module)
+# ---------------------------------------------------------------------------------------------------------
+# CLASSES: RelTR (Relation Transformer) 预训练所采用的目标实体词典 (共 151 个物体类别，来源于 Visual Genome)
+# REL_CLASSES: 场景中主体与客体之间的交互谓词/动作关系 (共 51 个谓词类别，对应有向边的边属性 edge_attr)
+# =========================================================================================================
 CLASSES = ['N/A', 'airplane', 'animal', 'arm', 'bag', 'banana', 'basket', 'beach', 'bear', 'bed', 'bench', 'bike',
            'bird', 'board', 'boat', 'book', 'boot', 'bottle', 'bowl', 'box', 'boy', 'branch', 'building',
            'bus', 'cabinet', 'cap', 'car', 'cat', 'chair', 'child', 'clock', 'coat', 'counter', 'cow', 'cup',
@@ -60,41 +66,81 @@ REL_CLASSES = ['__background__', 'above', 'across', 'against', 'along', 'and', '
                'to', 'under', 'using', 'walking in', 'walking on', 'watching', 'wearing', 'wears', 'with']
 
 
+
+# =========================================================================================================
+# Hawkeye 论文方法映射：第 3.1.1 节 动作敏感图 (Action-Sensitive Graph, ASG)
+# ---------------------------------------------------------------------------------------------------------
+# 原理：
+# 1. 采用人体姿态估计网络 HigherHRNet 抽取视频中最多 5 个人物的 17 个关键骨骼点坐标 (X_a = {x_a^1, ..., x_a^n})。
+# 2. 特征维度：5 人 × 17 关节点 = 85 维。
+# 3. 通过线性投影层 self.pose_projector 将 85 维的人体骨骼姿态坐标投影对齐至大模型隐藏空间 (4096 维)。
+# =========================================================================================================
 class pose_feat(nn.Module):
+    """
+    动作敏感图 (ASG) 姿态特征编码器：
+    输入: [Batch, 85] (5个人 × 17个关节坐标)
+    输出: [Batch, 4096] 对齐至与 Vicuna-7B 语言空间同维度的姿态表征向量
+    """
     def __init__(self):
         super(pose_feat, self).__init__()
+        # 85 维姿态坐标映射到 LLM 隐藏层维度 4096
         self.pose_projector = nn.Linear(85, 4096)
         self.pose_projector.requires_grad_(True)
 
     def forward(self, pose_feat):
+        # 展平输入: [Batch, 5, 17] -> [Batch, 85]
         pose_feat = pose_feat.view(pose_feat.size(0), -1)
+        # 线性投射: [Batch, 85] -> [Batch, 4096]
         pose_feat = self.pose_projector(pose_feat)
         return pose_feat
 
 
 def build_pose_tower():
+    """构建姿态塔 (Pose Tower)"""
     return pose_feat()
 
 
 def build_pose_projector():
+    """构建姿态特征后处理投影层 (4096 -> 4096)"""
     return nn.Linear(4096, 4096)
 
 
+
+# =========================================================================================================
+# Hawkeye 论文方法映射：第 3.1.2 节 物体关系敏感图 (Object-Relation Sensitive Graph, ORG)
+# ---------------------------------------------------------------------------------------------------------
+# 原理与对应公式：
+# 1. 场景关系提取：使用预训练 RelTR 提取场景中的主体、客体及相互作用谓词三元组 (subject, predicate, object)。
+# 2. 图神经网络 MaskGTN：基于 PyTorch Geometric (PyG) 搭建图卷积层，融合节点特征与有向边交互属性。
+#    对应论文公式 (4)：H^{(l+1)} = \sigma( \tilde{D}^{-1/2} \tilde{A} \tilde{D}^{-1/2} H^{(l)} W^{(l)} )
+# 3. 全局池化：经多层图卷积后，通过 global_mean_pool 将图拓扑压缩并投射至 4096 维作为场景 Token X_s。
+# =========================================================================================================
 class GTNLayer(MessagePassing):
+    """
+    MaskGTN 图卷积层 (基于 PyG MessagePassing 消息传递机制):
+    - in_channels: 节点特征输入维度 (初始为 151 维物体类别概率分布)
+    - out_channels: 节点特征输出维度 (隐藏层通道 4096 维)
+    - edge_attr_dim: 交互谓词边属性维度 (51 维谓词概率分布)
+    """
     def __init__(self, in_channels, out_channels, edge_attr_dim):
-        super(GTNLayer, self).__init__(aggr='add')
+        super(GTNLayer, self).__init__(aggr='add')  # 使用求和聚合 (Sum Aggregation)
         self.linear = nn.Linear(in_channels, out_channels)
         self.edge_attr_linear = nn.Linear(edge_attr_dim, in_channels)
         self.edge_attr_dim = edge_attr_dim
 
     def forward(self, x, edge_index, edge_attr=None):
-        # 添加自环并更新边属性
+        # 1. 添加自环 (Self-loops) 并构建对应的边属性
         edge_index, edge_attr = self.add_self_loops_with_edge_attr(edge_index, edge_attr, x.size(0), self.edge_attr_dim)
+        # 2. 沿拓扑边执行消息传递与聚合 (Message Passing)
         x = self.propagate(edge_index, x=x, edge_attr=edge_attr)
+        # 3. 经过线性变换更新节点状态: H^{(l+1)} = H^{(l)} W^{(l)}
         x = self.linear(x)
         return x
 
     def message(self, x_j, edge_index, edge_attr):
+        """
+        消息函数: 将邻居节点特征 x_j 与变换后的边属性 edge_attr 进行多模态残差融合
+        """
         if edge_attr is not None:
             edge_attr_transformed = self.edge_attr_linear(edge_attr.to(dtype=x_j.dtype))
             return x_j + edge_attr_transformed
@@ -103,14 +149,14 @@ class GTNLayer(MessagePassing):
 
     @staticmethod
     def add_self_loops_with_edge_attr(edge_index, edge_attr, num_nodes, edge_attr_dim):
-        # 添加自环
+        """为图拓扑添加自环 (Self-loops)，保证节点自身特征在卷积迭代中得以保留"""
         self_loops = torch.eye(num_nodes, dtype=torch.long)
         self_loops = self_loops.nonzero(as_tuple=False).t().contiguous().cuda()
 
-        # 为自环创建边属性（例如，可以使用全零向量）
+        # 自环边属性初始化为全 0 向量
         self_loop_attr = torch.zeros((num_nodes, edge_attr_dim))
 
-        # 合并原始边和自环
+        # 合并真实拓扑边与自环边
         edge_index = torch.cat([edge_index.cuda(), self_loops.cuda()], dim=1)
         edge_attr = torch.cat([edge_attr.cuda(), self_loop_attr.cuda()], dim=0) if edge_attr is not None else None
 
@@ -118,17 +164,26 @@ class GTNLayer(MessagePassing):
 
 
 class GTN(nn.Module):
+    """
+    ORG 场景图网络主体 (Graph Transformer Network):
+    输入: scene_feat 353 维 RelTR 检测特征
+          - 前 51 维: 关系谓词概率分布 probas (边属性)
+          - 中间 151 维: 主体类别概率分布 probas_sub (主节点特征)
+          - 后 151 维: 客体类别概率分布 probas_obj (客节点特征)
+    输出: [1, 4096] 聚合了环境物体交互拓扑的场景特征向量 X_s
+    """
     def __init__(self, num_layers, in_channels, hidden_channels, out_channels, edge_attr_dim):
         super(GTN, self).__init__()
         self.conv_layers = nn.ModuleList()
         self.num_layers = num_layers
 
-        # 创建多层GTNLayer
+        # 级联多层 GTNLayer 图卷积层
         channels = in_channels
         for _ in range(num_layers):
             self.conv_layers.append(GTNLayer(channels, hidden_channels, edge_attr_dim))
             channels = hidden_channels
 
+        # 最终投影层: hidden_channels (4096) -> out_channels (4096)
         self.linear = nn.Linear(hidden_channels, out_channels)
         self.linear.requires_grad_(True)
 
@@ -139,10 +194,12 @@ class GTN(nn.Module):
     def forward(self, scene_feat):
         nodes = []
         edges = []
+        # 1. 拆分 RelTR 输出的三元组概率向量: 51维谓词 + 151维主体 + 151维客体
         probas, probas_sub, probas_obj = scene_feat[:, :51], scene_feat[:, 51:202], scene_feat[:, 202:]
         node_features = []
         edge_features = probas
 
+        # 2. 动态解析实体节点与交互边 (构建非冗余图拓扑 G_i = (R_i, E_i))
         for i in range(probas.shape[0]):
             sub = CLASSES[probas_sub[i].argmax()]
             obj = CLASSES[probas_obj[i].argmax()]
@@ -153,32 +210,41 @@ class GTN(nn.Module):
                 nodes.append(obj)
                 node_features.append(probas_obj[i])
             edges.append((sub, obj))
+        
+        # 构造 PyG 边索引张量 edge_index [2, Num_Edges]
         edge_index = torch.tensor([[nodes.index(src), nodes.index(dst)] for src, dst in edges],
                                   dtype=torch.long).t().contiguous()
         node_features = torch.stack(node_features, dim=0)
+        # 封装为 PyG 标准 Data 图对象
         graph = Data(x=node_features, edge_index=edge_index, edge_attr=edge_features)
 
+        # 3. 多层图卷积前向聚合更新
         x, edge_index, edge_attr = graph.x, graph.edge_index, graph.edge_attr
         for layer in self.conv_layers:
             x = layer(x, edge_index, edge_attr)
 
+        # 4. 全图均值池化 (Global Mean Pooling): 将变长节点集合聚合为一个全局图表征
         x = gnn.global_mean_pool(x, torch.arange(0, x.size(0), dtype=torch.long, device=x.device))
 
+        # 5. 线性映射至 4096 维输出
         x = self.linear(x)
         return x
 
 
 def build_scene_tower():
+    """构建场景图塔 (Scene Tower) - 2层GTN图卷积网络"""
     num_layers = 2
-    in_channels = 151
-    hidden_channels = 4096
-    out_channels = 4096
-    edge_attr_dim = 51
+    in_channels = 151       # 151 维物体类别
+    hidden_channels = 4096  # 4096 维隐藏层
+    out_channels = 4096     # 4096 维输出
+    edge_attr_dim = 51      # 51 维关系谓词边属性
     return GTN(num_layers, in_channels, hidden_channels, out_channels, edge_attr_dim)
 
 
 def build_scene_projector():
+    """构建场景特征后处理投影层 (4096 -> 4096)"""
     return nn.Linear(4096, 4096)
+
 
 
 class RMSNorm(torch.nn.Module):
@@ -417,12 +483,30 @@ class Mlp(nn.Module):
         return x
 
 
+# =========================================================================================================
+# Hawkeye 论文方法映射：第 3.2 节 平衡异构混合专家网络 (Balanced Heterogeneous MoE, B-H MoE)
+# ---------------------------------------------------------------------------------------------------------
+# 原理与对应公式：
+# 1. 设计动机：人体骨骼动作特征 (pose_feat) 与物体交互拓扑图特征 (scene_feat) 属于异构多模态信息，
+#    在联合表征时若简单求和易引发模态主导偏向问题。
+# 2. 投影专家 (Projection Experts, PE): 搭建 N=2 个独立的重采样专家网络 E_i (基于 TransformerBlock)。
+# 3. 模态路由器 (Modality Router R): 由 MLP 实现自适应软门控权重计算。
+#    对应论文公式 (5)：y = LayerNorm( \sum_{i=1}^N R(h)_i E_i(h) )
+#    依据输入画面的复杂度，软性权衡动作特征与拓扑图特征对最终情绪异常判断的贡献占比。
+# =========================================================================================================
 class MOE(nn.Module):
+    """
+    平衡异构混合专家网络 (B-H MoE):
+    输入: pose_feat [B, 1, 4096], scene_feat [B, 1, 4096]
+    输出: 动态加权融合后的场景+动作综合表征向量 [B, 4096]
+    """
     def __init__(self, params):
         super(MOE, self).__init__()
         self.resample_layers = nn.ModuleDict()
-        self.num_experts = 2
-        self.num_resample_layers = 1
+        self.num_experts = 2          # 论文设定：N=2 个投影专家 (Expert 0 & Expert 1)
+        self.num_resample_layers = 1  # 每个专家使用 1 层 TransformerBlock 重采样器
+        
+        # 1. 搭建 N=2 个异构投影专家网络 (Resample Layers)
         for expert in range(self.num_experts):
             expert = str(expert)
             self.resample_layers[expert] = nn.ModuleList()
@@ -436,14 +520,15 @@ class MOE(nn.Module):
         self.routers = nn.ModuleDict()
         self.clip_proj1 = nn.ModuleDict()
         self.clip_proj2 = nn.ModuleDict()
-        self.routers = nn.ModuleDict()
         self.start_tag = nn.ParameterDict()
         self.end_tag = nn.ParameterDict()
 
         for modal in ['pose']:
+            # 2. 模态门控路由器 R: 由 MLP 实现，输入 4096，输出 2 个专家的门控打分
             self.routers[modal] = Mlp(
                 4096, 4096 * 4, self.num_experts)
 
+            # 可学习查询 Token (Resample Tokens，长度 30)
             self.resample_tokens[modal] = nn.Parameter(
                 torch.empty([1, 30, resampler_params.dim]))
             nn.init.normal_(self.resample_tokens[modal], std=0.02)
@@ -452,6 +537,7 @@ class MOE(nn.Module):
                 nn.Linear(4096, resampler_params.dim),
                 nn.LayerNorm(resampler_params.dim))
 
+            # 融合后的投影与归一化层: 对应公式 (5) 外层的 LayerNorm
             self.clip_proj2[modal] = nn.Sequential(
                 nn.Linear(resampler_params.dim, params.dim),
                 nn.LayerNorm(params.dim))
@@ -463,11 +549,15 @@ class MOE(nn.Module):
             param.requires_grad = True
 
     def forward(self, pose_feat, scene_feat):
+        # 1. 拼接动作特征与场景图特征: [B, 2, 4096]
         image_feats = torch.cat((pose_feat, scene_feat), dim=1)
+        
+        # 2. 对应论文公式 (5): 路由器计算各个专家的路由权重 R(h)
         routing_weights = self.routers['pose'](image_feats).sigmoid()
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         image_feats_experts = []
 
+        # 3. 将输入送入各个专家网络 E_i(h) 并乘以门控权重 R(h)_i
         for expert_id in range(self.num_experts):
             image_feats_expert = image_feats
             for layer in self.resample_layers[str(expert_id)]:
@@ -475,16 +565,20 @@ class MOE(nn.Module):
             image_feats_expert = image_feats_expert[:, :self.resample_tokens['pose'].size(1)]
             routing_weight = routing_weights[:, :self.resample_tokens['pose'].size(
                 1), expert_id]
-            # [B, L, D] * [B, L, 1]
+            # [B, L, D] * [B, L, 1] 专家加权组合
             image_feats_expert = image_feats_expert * routing_weight[:, :, None]
             image_feats_experts.append(image_feats_expert)
+            
+        # 4. 对专家输出求和并应用归一化投影层: y = LayerNorm(\sum R(h)_i E_i(h))
         image_feats = sum(image_feats_experts)
         image_feats = self.clip_proj2['pose'](image_feats)
 
+        # 输出展平为标准 4096 维表征
         return image_feats.reshape(-1, 4096)
 
 
 def build_moe():
+    """构建平衡异构混合专家网络 (B-H MoE) 实例"""
     moe = MOE(ModelArgs())
     for param in moe.parameters():
         param.requires_grad = True
@@ -492,7 +586,9 @@ def build_moe():
 
 
 def build_moe_projector():
+    """构建 MoE 融合特征后处理投影层 (4096 -> 4096)"""
     return nn.Linear(4096, 4096)
+
 
 
 class LlavaMetaModel:
@@ -670,26 +766,31 @@ class LlavaMetaForCausalLM(ABC):
         return tower
 
     def encode_images(self, images):
+        """图像特征编码 (LanguageBind Image Tower + mm_projector)"""
         image_features = self.get_model().get_image_tower()(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
     def encode_videos(self, videos):
+        """视频特征编码 (LanguageBind Video Tower + mm_projector)"""
         video_features = self.get_model().get_video_tower()(videos)
         video_features = self.get_model().mm_projector(video_features)
         return video_features
 
     def encode_poses(self, poses):
+        """动作特征编码 (HigherHRNet pose_tower + pose_projector) - 对应 §3.1.1"""
         pose_features = self.get_model().get_pose_tower()(poses)
         pose_features = self.get_model().pose_projector(pose_features)
         return pose_features
 
     def encode_scenes(self, scenes):
+        """场景图特征编码 (RelTR + GTN scene_tower + scene_projector) - 对应 §3.1.2"""
         scene_features = self.get_model().get_scene_tower()(scenes)
         scene_features = self.get_model().scene_projector(scene_features)
         return scene_features
 
     def moe_route(self, pose_feat, scene_feat):
+        """B-H MoE 专家路由融合动作与场景特征 - 对应 §3.2"""
         moe_featers = self.get_model().get_moe()(pose_feat.unsqueeze(0), scene_feat.unsqueeze(0))
         moe_featers = self.get_model().moe_projector(moe_featers)
         return moe_featers
@@ -698,26 +799,23 @@ class LlavaMetaForCausalLM(ABC):
             self, input_ids, attention_mask, past_key_values, labels, X_modalities
     ):
         '''
-        X_modalities [
-        [img_feature, img_feature, video_feature, audio_feature],
-        ['image', 'image', 'video', 'audio']
-        ]
+        多模态序列拼接与大语言模型输入对齐函数:
+        X_modalities 包含:
+          - Xs: 原始视频帧张量
+          - poses: 人体姿态骨骼点序列 (HigherHRNet 提取)
+          - scenes: 场景交互关系三元组 (RelTR 提取)
+          - keys: 模态标识列表 (例如 ['video'])
         '''
-        # Xs, keys = X_modalities
-        # Xs, poses, keys = X_modalities
-        # print('prepare_inputs_labels_for_multimoda')
         Xs, poses, scenes, keys = X_modalities
-        print(Xs[0].shape)
-
 
         all_tower = self.get_all_tower(set(keys)) if len(keys) > 0 else None
-        # print(2.5)
         if all_tower is None or X_modalities[0][0] is None or input_ids.shape[1] == 1:
             if past_key_values is not None and all_tower is not None and Xs is not None and input_ids.shape[1] == 1:
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                                             dtype=attention_mask.dtype, device=attention_mask.device)
             return input_ids, attention_mask, past_key_values, None, labels
         try:
+            # 1. 抽取全局视频视觉特征 Token: [B, T_tokens, 4096]
             X_features_video = [getattr(self, 'encode_videos')(X.unsqueeze(0)).flatten(0, 1) for X in
                                 Xs]  # expand to get batchsize
                 
@@ -726,16 +824,25 @@ class LlavaMetaForCausalLM(ABC):
 
         X_features = []
 
+        # =================================================================================================
+        # Hawkeye 论文核心融合逻辑：
+        # 将原始视频视觉特征与经 MoE 平衡路由后的场景细粒度 Token 进行跨维度拼接
+        # =================================================================================================
         for i in range(len(X_features_video)):
 
             if poses[i] != None:
+                # 动作敏感特征编码: §3.1.1
                 X_features_pose = getattr(self, 'encode_poses')(poses[i])
+                # 物体拓扑场景图编码: §3.1.2
                 X_features_scene = getattr(self, 'encode_scenes')(scenes[i])
+                # 异构 MoE 专家门控融合: §3.2
                 X_moe_feat = getattr(self, 'moe_route')(X_features_pose, X_features_scene)
 
+                # 将视频特征序列与 MoE 场景增强向量拼接，送入大语言模型 (Vicuna-7B)
                 X_features.append(torch.cat((X_features_video[i], X_moe_feat), dim=0))
             else:
                 X_features.append(X_features_video[i])
+
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
