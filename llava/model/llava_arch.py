@@ -1,15 +1,39 @@
+"""
+Hawkeye 多模态大模型核心网络架构定义文件 (llava_arch.py)
+====================================================================================================
+论文出处: 
+  Hawkeye: Discovering and Grounding Implicit Anomalous Sentiment in Recon-videos 
+  via Scene-enhanced Video Large Language Model (ACM MM 2024)
+
+本文件核心功能:
+  1. 图结构场景建模 (Section 3.1):
+     - 动作敏感图 ASG (Section 3.1.1): pose_feat 骨骼关键点线性投影网络 (85维 -> 4096维)
+     - 物体关系敏感图 ORG (Section 3.1.2): GTNLayer & GTN 基于 PyG 的 MaskGTN 场景图卷积网络
+  2. 平衡异构混合专家网络 B-H MoE (Section 3.2):
+     - MOE: 包含 2 个 TransformerBlock 投影专家 (PE) 与 MLP 软门控路由器 R(h)
+  3. 多模态元模型基类 (Section 3.0 & Backbone):
+     - LlavaMetaModel: 管理视觉塔、姿态塔、场景塔、MoE网络及其后处理投影器
+     - LlavaMetaForCausalLM: 负责在 prepare_inputs_labels_for_multimodal 中将全局视频 Token
+       与 MoE 场景细粒度 Token 拼接，替换文本提示词中的占位符，送入大语言模型 (Vicuna-7B) 进行推理
+====================================================================================================
+"""
+
 from abc import ABC, abstractmethod
 
 import torch
 import torch.nn as nn
+# 引入 PyTorch Geometric (PyG) 核心图神经网络库，用于实现 Section 3.1.2 中的 MaskGTN
 import torch_geometric.nn as gnn
 from torch_geometric.nn import MessagePassing
 from torch_geometric.data import Data
 from torch_geometric.utils import add_self_loops, degree
 
+# 多模态编码器与投影器构建工厂函数
 from .multimodal_encoder.builder import build_image_tower, build_video_tower
 from .multimodal_projector.builder import build_vision_projector
 from dataclasses import dataclass
+
+# 支持 FairScale 模型并行技术 (可选分布式训练优化)
 try:
     import fairscale.nn.model_parallel.initialize as fs_init
     from fairscale.nn.model_parallel.layers import (
@@ -19,23 +43,31 @@ try:
     )
 except ImportError:
     pass
+
 from typing import Optional, Tuple
 import torch.nn.functional as F
+
+# FlashAttention 高性能注意力计算，若环境未编译 flash_attn 则优雅回退到 PyTorch 原生 scaled_dot_product_attention
 try:
     from flash_attn import flash_attn_func
 except ImportError:
     def flash_attn_func(q, k, v, dropout_p=0.0, causal=False):
-        # Fallback to PyTorch scaled_dot_product_attention:
-        # q, k, v: [bsz, seqlen, n_heads, head_dim] -> transpose to [bsz, n_heads, seqlen, head_dim]
+        """FlashAttention 回退实现: 利用 PyTorch 2.0+ 原生高效注意力算子"""
+        # q, k, v 维度: [bsz, seqlen, n_heads, head_dim] -> 转置为 [bsz, n_heads, seqlen, head_dim]
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
         out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=causal)
         return out.transpose(1, 2)
+
 import copy
 
+# 导入关键标记常量:
+# IGNORE_INDEX: 交叉熵计算中忽略的标签 ID (-100)，用于遮蔽无需计算损失的视觉 Token
+# X_TOKEN_INDEX: 多模态占位符在词表中的 Token ID (例如 <video>、<image>)
 from llava.constants import IGNORE_INDEX, X_TOKEN_INDEX, DEFAULT_X_PATCH_TOKEN, DEFAULT_X_START_TOKEN, \
     DEFAULT_X_END_TOKEN
+
 
 # =========================================================================================================
 # Hawkeye 论文方法映射：第 3.1 节 图结构场景建模模块 (Graph-structured Scene Modeling Module)
@@ -247,83 +279,67 @@ def build_scene_projector():
 
 
 
+# =========================================================================================================
+# Transformer 基础组件库 (供 Section 3.2 中 B-H MoE 的 Projection Experts 使用)
+# ---------------------------------------------------------------------------------------------------------
+# 包含 RMSNorm、RoPE 旋转位置编码、多头注意力 Attention、SwiGLU 门控前馈网络 FeedForward 等
+# =========================================================================================================
+
 class RMSNorm(torch.nn.Module):
+    """
+    均方根层归一化 (Root Mean Square Layer Normalization):
+    公式: y = (x / RMS(x)) * gamma, 其中 RMS(x) = sqrt(mean(x^2) + eps)
+    相比标准 LayerNorm 去掉了减均值 (mean-centering) 操作，节省约 7% 显存带宽与计算开销。
+    """
     def __init__(self, dim: int, eps: float = 1e-6):
-        """
-        Initialize the RMSNorm normalization layer.
-
-        Args:
-            dim (int): The dimension of the input tensor.
-            eps (float, optional): A small value added to the denominator for numerical stability. Default is 1e-6.
-
-        Attributes:
-            eps (float): A small value added to the denominator for numerical stability.
-            weight (nn.Parameter): Learnable scaling parameter.
-
-        """
         super().__init__()
         self.eps = eps
+        # 可学习通道缩放因子 gamma
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        """
-        Apply the RMSNorm normalization to the input tensor.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The normalized tensor.
-
-        """
+        # 计算均方根并归一化
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        """
-        Forward pass through the RMSNorm layer.
-
-        Args:
-            x (torch.Tensor): The input tensor.
-
-        Returns:
-            torch.Tensor: The output tensor after applying RMSNorm.
-
-        """
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
-    n_layers: int = 8
-    n_heads: int = 8
-    vocab_size: int = -1  # defined later by tokenizer
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    norm_eps: float = 1e-5
-
-    max_batch_size: int = 8
-    max_seq_len: int = 256
+    """MoE 专家 TransformerBlock 网络结构超参数配置"""
+    dim: int = 4096          # 隐藏层特征维度 (与 Vicuna-7B 保持一致)
+    n_layers: int = 8        # 网络层数
+    n_heads: int = 8         # 注意力头数 (在 MoE 专家内会被深拷贝并覆盖为 16)
+    vocab_size: int = -1     # 词表大小
+    multiple_of: int = 256   # 保证 SwiGLU 隐藏层维度为 256 的倍数以最大化 GPU 算力利用率
+    norm_eps: float = 1e-5   # 归一化微小偏置项
+    max_batch_size: int = 8  # 推理最大 BatchSize
+    max_seq_len: int = 256   # 最大序列长度
 
 
 default_linear_init = nn.init.xavier_uniform_
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
-                             [: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)  # type: ignore
-    freqs = torch.outer(t, freqs).float()  # type: ignore
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    """
+    预计算旋转位置编码 (RoPE, Rotary Position Embedding) 的复数旋转因子矩阵:
+    公式: freqs_cis[m, i] = exp(i * m * theta^(-2(i-1)/dim))
+    """
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # 构建复数形式 cos + i*sin
     return freqs_cis
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    """调整 RoPE 频率矩阵形状以支持广播运算"""
     ndim = x.ndim
     assert 0 <= 1 < ndim
     assert freqs_cis.shape == (x.shape[1], x.shape[-1])
-    shape = [d if i == 1 or i == ndim -
-                  1 else 1 for i, d in enumerate(x.shape)]
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(*shape)
 
 
@@ -332,6 +348,10 @@ def apply_rotary_emb(
         xk: torch.Tensor,
         freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    对 Query 和 Key 向量应用旋转位置编码 (RoPE):
+    通过复数乘法实现二维平面的向量逆时针旋转，从而注入相对位置语义。
+    """
     xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
     xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
     freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
@@ -341,28 +361,20 @@ def apply_rotary_emb(
 
 
 class Attention(nn.Module):
+    """
+    多头自注意力机制 (Multi-Head Self-Attention):
+    支持 RoPE 旋转位置编码、KV Cache 增量推理加速以及 FlashAttention 算子
+    """
     def __init__(self, args: ModelArgs):
         super().__init__()
-
         self.n_local_heads = args.n_heads
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = nn.Linear(
-            args.dim,
-            args.n_heads * self.head_dim,
-        )
-        self.wk = nn.Linear(
-            args.dim,
-            args.n_heads * self.head_dim,
-        )
-        self.wv = nn.Linear(
-            args.dim,
-            args.n_heads * self.head_dim,
-        )
-        self.wo = nn.Linear(
-            args.n_heads * self.head_dim,
-            args.dim,
-        )
+        # 线性映射层: W_q, W_k, W_v, W_o
+        self.wq = nn.Linear(args.dim, args.n_heads * self.head_dim)
+        self.wk = nn.Linear(args.dim, args.n_heads * self.head_dim)
+        self.wv = nn.Linear(args.dim, args.n_heads * self.head_dim)
+        self.wo = nn.Linear(args.n_heads * self.head_dim, args.dim)
 
         self.flash = True
         self.k_cache, self.v_cache = None, None
@@ -370,15 +382,19 @@ class Attention(nn.Module):
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor],
                 prompt=None):
         bsz, seqlen, _ = x.shape
+        # 1. 线性投射生成 Q, K, V
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        # 拆分为多头形式: [B, SeqLen, NumHeads, HeadDim]
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_heads, self.head_dim)
 
+        # 2. 注入 RoPE 旋转位置编码
         if freqs_cis is not None:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # 3. 管理 KV Cache (用于自回归推理加速)
         if self.k_cache is None or self.v_cache is None:
             keys, values = xk, xv
         else:
@@ -389,25 +405,33 @@ class Attention(nn.Module):
             keys = self.k_cache[:bsz, :start_pos + seqlen]
             values = self.v_cache[:bsz, :start_pos + seqlen]
 
+        # 4. 执行注意力打分与加权聚合 (优先调用 FlashAttention)
         output = flash_attn_func(
             xq, keys, values, dropout_p=0.0, causal=mask is not None)
         output = output.contiguous().view(bsz, seqlen, -1)
 
+        # 5. 经过输出矩阵 W_o 投射
         return self.wo(output)
 
     def allocate_kv_cache(self, max_batch_size: int, max_seq_len: int) -> None:
-        kv_cache_shape = (max_batch_size, max_seq_len,
-                          self.n_local_heads, self.head_dim)
+        """显式分配 KV Cache 显存空间"""
+        kv_cache_shape = (max_batch_size, max_seq_len, self.n_local_heads, self.head_dim)
         if self.k_cache is None or self.k_cache.size() != kv_cache_shape:
             self.k_cache = torch.empty(kv_cache_shape)
         if self.v_cache is None or self.v_cache.size() != kv_cache_shape:
             self.v_cache = torch.empty(kv_cache_shape)
 
     def destroy_kv_cache(self) -> None:
+        """释放 KV Cache 显存"""
         self.k_cache, self.v_cache = None, None
 
 
 class FeedForward(nn.Module):
+    """
+    SwiGLU 门控前馈神经网络 (Swish Gated Linear Unit):
+    公式: FFN(x) = W_2 * (SiLU(W_1 * x) \odot (W_3 * x))
+    相比标准 ReLU/GELU FFN，SwiGLU 拥有更丰富的信息门控通路，表征能力显著提升。
+    """
     def __init__(
             self,
             dim: int,
@@ -415,19 +439,13 @@ class FeedForward(nn.Module):
             multiple_of: int,
     ):
         super().__init__()
+        # 计算 SwiGLU 中间隐藏维度
         hidden_dim = int(2 * hidden_dim / 3)
-        hidden_dim = multiple_of * \
-                     ((hidden_dim + multiple_of - 1) // multiple_of)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = nn.Linear(
-            dim, hidden_dim, bias=False,
-        )
-        self.w2 = nn.Linear(
-            hidden_dim, dim, bias=False
-        )
-        self.w3 = nn.Linear(
-            dim, hidden_dim, bias=False
-        )
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)  # 门控分支
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)  # 下投影层
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)  # 升维线性分支
 
     def _silu_gating(self, x, y):
         return F.silu(x) * y
@@ -437,6 +455,11 @@ class FeedForward(nn.Module):
 
 
 class TransformerBlock(nn.Module):
+    """
+    标准 Pre-LayerNorm Transformer 解码层:
+    组成: RMSNorm -> Attention -> 残差连接 -> RMSNorm -> SwiGLU FFN -> 残差连接
+    在 Hawkeye 中作为 B-H MoE 专家网络 (Projection Expert) 的重采样器 (Resampler)。
+    """
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
         self.n_heads = args.n_heads
@@ -458,29 +481,33 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, start_pos: int, freqs_cis: torch.Tensor, mask: Optional[torch.Tensor],
                 prompt=None):
+        # 1. 注意力子层 (含前置归一化与残差连接)
         h = self._forward_attention(x, start_pos, freqs_cis, mask, prompt)
+        # 2. 前馈子层 (含前置归一化与残差连接)
         out = self._forward_ffn(h)
         return out
 
 
 class Mlp(nn.Module):
-    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
-
+    多层感知机 (MLP):
+    用于 B-H MoE 中的模态路由器 (Modality Router R)，将融合输入映射为专家门控打分
+    """
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
 
-        self.fc1 = nn.Linear(in_features, out_features)
+        self.fc1 = nn.Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(out_features, out_features)
+        self.fc2 = nn.Linear(hidden_features, out_features)
 
     def forward(self, x):
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)
         return x
+
 
 
 # =========================================================================================================
@@ -591,27 +618,44 @@ def build_moe_projector():
 
 
 
+# =========================================================================================================
+# Hawkeye 多模态元模型基类 (LlavaMetaModel)
+# ---------------------------------------------------------------------------------------------------------
+# 功能职责:
+# 1. 负责管理模型的各个子塔 (Towers):
+#    - image_tower: 静态图像编码器 (LanguageBind)
+#    - video_tower: 全局视频编码器 (LanguageBind Video, 抽取整体视觉序列)
+#    - pose_tower: 人体骨骼姿态塔 (HigherHRNet, 对应 §3.1.1 ASG)
+#    - scene_tower: 场景图神经网络塔 (RelTR + MaskGTN, 对应 §3.1.2 ORG)
+#    - moe: 平衡异构混合专家网络 (对应 §3.2 B-H MoE)
+# 2. 提供统一的模块初始化函数 (initialize_*_modules)，支持预训练权重挂载与 FSDP/ZeRO 显存并行
+# =========================================================================================================
 class LlavaMetaModel:
-
     def __init__(self, config):
         super(LlavaMetaModel, self).__init__(config)
 
+        # 动态检测配置中的塔结构并依次实例化
         if hasattr(config, "mm_image_tower"):
             self.image_tower = build_image_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
         if hasattr(config, "mm_video_tower"):
+            # 构建 LanguageBind 视频视觉塔
             self.video_tower = build_video_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
         if hasattr(config, "mm_pose_tower"):
+            # 构建动作敏感图 (ASG) 姿态塔: §3.1.1
             self.pose_tower = build_pose_tower()
             self.pose_projector = build_pose_projector()
         if hasattr(config, "mm_scene_tower"):
+            # 构建物体关系敏感图 (ORG) 场景塔: §3.1.2
             self.scene_tower = build_scene_tower()
             self.scene_projector = build_scene_projector()
         if hasattr(config, "mm_moe"):
+            # 构建平衡异构混合专家网络 (B-H MoE): §3.2
             self.moe = build_moe()
             self.moe_projector = build_moe_projector()
 
+    # --- 统一的组件 Getter 接口 (自动解包分布式 FSDP 列表包装) ---
     def get_moe(self):
         moe = getattr(self, 'moe', None)
         if type(moe) is list:
@@ -643,13 +687,13 @@ class LlavaMetaModel:
         return scene_tower
 
     def initialize_image_modules(self, model_args, fsdp=None):
+        """初始化图像模块与多模态投影层"""
         image_tower = model_args.image_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
 
         self.config.mm_image_tower = image_tower
-
         image_tower = build_image_tower(model_args)
 
         if fsdp is not None and len(fsdp) > 0:
@@ -665,6 +709,7 @@ class LlavaMetaModel:
 
         self.mm_projector = build_vision_projector(self.config)
 
+        # 若存在预训练投影层权重则定向载入
         if pretrain_mm_mlp_adapter is not None:
             mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
 
@@ -674,13 +719,13 @@ class LlavaMetaModel:
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
     def initialize_video_modules(self, model_args, fsdp=None):
+        """初始化视频模块与多模态投影层 (加载 LanguageBind 视频编码器)"""
         video_tower = model_args.video_tower
         mm_vision_select_layer = model_args.mm_vision_select_layer
         mm_vision_select_feature = model_args.mm_vision_select_feature
         pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
 
         self.config.mm_video_tower = video_tower
-
         video_tower = build_video_tower(model_args)
 
         if fsdp is not None and len(fsdp) > 0:
@@ -705,6 +750,7 @@ class LlavaMetaModel:
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
     def initialize_pose_modules(self, model_args, fsdp=None):
+        """初始化动作敏感图模块 (ASG / HigherHRNet 姿态塔: §3.1.1)"""
         pose_tower = model_args.pose_tower
         self.config.mm_pose_tower = pose_tower
 
@@ -717,6 +763,7 @@ class LlavaMetaModel:
         self.pose_projector = build_pose_projector()
 
     def initialize_scene_modules(self, model_args, fsdp=None):
+        """初始化物体关系敏感图模块 (ORG / MaskGTN 场景拓扑塔: §3.1.2)"""
         scene_tower = model_args.scene_tower
         self.config.mm_scene_tower = scene_tower
 
@@ -729,6 +776,7 @@ class LlavaMetaModel:
         self.scene_projector = build_scene_projector()
 
     def initialize_moe_modules(self, model_args, fsdp=None):
+        """初始化平衡异构混合专家网络模块 (B-H MoE: §3.2)"""
         moe = model_args.moe
         self.config.mm_moe = moe
         moe = build_moe()
@@ -738,6 +786,7 @@ class LlavaMetaModel:
             self.moe = moe
 
         self.moe_projector = build_moe_projector()
+
 
 
 class LlavaMetaForCausalLM(ABC):
@@ -844,15 +893,16 @@ class LlavaMetaForCausalLM(ABC):
                 X_features.append(X_features_video[i])
 
 
+        # ---------------------------------------------------------------------------------------------
+        # 2. 遍历 Batch 中的每一个样本，将多模态特征切入文本序列 (替换 <video> 占位符)
+        # ---------------------------------------------------------------------------------------------
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         cur_X_idx = 0
 
         for batch_idx, cur_input_ids in enumerate(input_ids):
-            if (
-            torch.any(torch.stack([cur_input_ids == X_TOKEN_INDEX[key.upper()] for key in keys]), dim=0)).sum() == 0:
-                # multimodal LLM, but the current sample is not multimodal
-                # FIXME: this is a hacky fix, for deepspeed zero3 to work
+            # 判断当前样本是否包含多模态占位符 (DeepSpeed Zero-3 兼容性分支)
+            if (torch.any(torch.stack([cur_input_ids == X_TOKEN_INDEX[key.upper()] for key in keys]), dim=0)).sum() == 0:
                 half_len = cur_input_ids.shape[0] // 2
                 cur_X_features = X_features[cur_X_idx]
                 cur_input_embeds_1 = self.get_model().embed_tokens(cur_input_ids[:half_len])
@@ -863,18 +913,24 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels.append(labels[batch_idx])
                 cur_X_idx += 1
                 continue
-            X_token_indices = \
-            torch.where(torch.any(torch.stack([cur_input_ids == X_TOKEN_INDEX[key.upper()] for key in keys]), dim=0))[0]
+
+            # 定位占位符索引 (例如 <video> 的位置)
+            X_token_indices = torch.where(
+                torch.any(torch.stack([cur_input_ids == X_TOKEN_INDEX[key.upper()] for key in keys]), dim=0)
+            )[0]
             cur_new_input_embeds = []
             if labels is not None:
                 cur_labels = labels[batch_idx]
                 cur_new_labels = []
                 assert cur_labels.shape == cur_input_ids.shape
+
+            # 循环切分并插入当前样本的多模态表征
             while X_token_indices.numel() > 0:
                 cur_X_features = X_features[cur_X_idx]
                 X_token_start = X_token_indices[0]
-                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_x_start_end',
-                                                                                  False):
+
+                # 分支 A: 启用了 Start/End 特殊标记包装 (如 <video_start> <video_patch>... <video_end>)
+                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_x_start_end', False):
                     cur_new_input_embeds.append(
                         self.get_model().embed_tokens(cur_input_ids[:X_token_start - 1]).detach())
                     cur_new_input_embeds.append(
@@ -884,37 +940,41 @@ class LlavaMetaForCausalLM(ABC):
                         self.get_model().embed_tokens(cur_input_ids[X_token_start + 1:X_token_start + 2]))
                     if labels is not None:
                         cur_new_labels.append(cur_labels[:X_token_start])
+                        # 视觉特征 Token 在训练计算交叉熵时被屏蔽 (填充 IGNORE_INDEX = -100)
                         cur_new_labels.append(torch.full((cur_X_features.shape[0],), IGNORE_INDEX, device=labels.device,
                                                          dtype=labels.dtype))
                         cur_new_labels.append(cur_labels[X_token_start:X_token_start + 1])
                         cur_labels = cur_labels[X_token_start + 2:]
+                # 分支 B: 标准直接占位替换 (Hawkeye 默认路径)
                 else:
                     cur_new_input_embeds.append(
                         self.get_model().embed_tokens(cur_input_ids[:X_token_start]))
+                    # 插入包含视频全局特征 + MoE 细粒度场景特征的多模态张量
                     cur_new_input_embeds.append(cur_X_features)
                     if labels is not None:
                         cur_new_labels.append(cur_labels[:X_token_start])
+                        # 关键：多模态特征位置标签填入 IGNORE_INDEX，模型不计算视觉本身的重构损失，只监督文本回答
                         cur_new_labels.append(torch.full((cur_X_features.shape[0],), IGNORE_INDEX, device=labels.device,
                                                          dtype=labels.dtype))
-
                         cur_labels = cur_labels[X_token_start + 1:]
+
                 cur_X_idx += 1
-                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_x_start_end',
-                                                                                  False):
+                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_x_start_end', False):
                     cur_input_ids = cur_input_ids[X_token_start + 2:]
                 else:
                     cur_input_ids = cur_input_ids[X_token_start + 1:]
                 X_token_indices = torch.where(
                     torch.any(torch.stack([cur_input_ids == X_TOKEN_INDEX[key.upper()] for key in keys]), dim=0))[0]
 
+            # 拼装占位符后剩余的文本 Token
             if cur_input_ids.numel() > 0:
-                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_x_start_end',
-                                                                                  False):
+                if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_x_start_end', False):
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids).detach())
                 else:
                     cur_new_input_embeds.append(self.get_model().embed_tokens(cur_input_ids))
                 if labels is not None:
                     cur_new_labels.append(cur_labels)
+
             cur_new_input_embeds = [x.to(device=self.device) for x in cur_new_input_embeds]
             cur_new_input_embeds = torch.cat(cur_new_input_embeds, dim=0)
             new_input_embeds.append(cur_new_input_embeds)
@@ -922,9 +982,13 @@ class LlavaMetaForCausalLM(ABC):
                 cur_new_labels = torch.cat(cur_new_labels, dim=0)
                 new_labels.append(cur_new_labels)
 
+        # ---------------------------------------------------------------------------------------------
+        # 3. 动态 Padding 对齐: 处理同一 Batch 中不同序列长度不一致的问题
+        # ---------------------------------------------------------------------------------------------
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
             max_len = max(x.shape[0] for x in new_input_embeds)
 
+            # Embeddings 补齐至最大长度 max_len
             new_input_embeds_align = []
             for cur_new_embed in new_input_embeds:
                 cur_new_embed = torch.cat((cur_new_embed,
@@ -933,6 +997,7 @@ class LlavaMetaForCausalLM(ABC):
                 new_input_embeds_align.append(cur_new_embed)
             new_input_embeds = torch.stack(new_input_embeds_align, dim=0)
 
+            # Labels 补齐 IGNORE_INDEX
             if labels is not None:
                 new_labels_align = []
                 _new_labels = new_labels
@@ -944,6 +1009,7 @@ class LlavaMetaForCausalLM(ABC):
                     new_labels_align.append(cur_new_label)
                 new_labels = torch.stack(new_labels_align, dim=0)
 
+            # Attention Mask 左右对齐补齐
             if attention_mask is not None:
                 new_attention_mask = []
                 for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(attention_mask, _new_labels,
@@ -969,13 +1035,20 @@ class LlavaMetaForCausalLM(ABC):
                     dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
+
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def initialize_X_tokenizer(self, model_args, tokenizer):
+        """
+        初始化多模态 Tokenizer 与词嵌入权重 (Embedding Layer 扩容):
+        1. 向 Tokenizer 注册特殊标记 (如 <video>, <image>, <video_start>, <video_end>)
+        2. 扩展模型 Embedding 矩阵尺寸以容纳新 Token
+        3. 对新增 Token 的权重使用已有词嵌入的均值进行初始化，防止训练初期产生剧烈梯度抖动
+        4. 根据微调配置 (tune_mm_mlp_adapter) 冻结或解冻输入输出 Embedding 层的参数梯度
+        """
         if model_args.mm_use_x_patch_token:
             for x in model_args.X:
                 tokenizer.add_tokens([DEFAULT_X_PATCH_TOKEN[x.upper()]], special_tokens=True)
-            # tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
             self.resize_token_embeddings(len(tokenizer))
 
         if model_args.mm_use_x_start_end:
@@ -985,18 +1058,18 @@ class LlavaMetaForCausalLM(ABC):
                     [DEFAULT_X_START_TOKEN[x.upper()], DEFAULT_X_END_TOKEN[x.upper()]], special_tokens=True)
             self.resize_token_embeddings(len(tokenizer))
 
+            # 对新增标记执行均值初始化 (Mean Initialization)
             if num_new_tokens > 0:
                 input_embeddings = self.get_input_embeddings().weight.data
                 output_embeddings = self.get_output_embeddings().weight.data
 
-                input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(
-                    dim=0, keepdim=True)
-                output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(
-                    dim=0, keepdim=True)
+                input_embeddings_avg = input_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
+                output_embeddings_avg = output_embeddings[:-num_new_tokens].mean(dim=0, keepdim=True)
 
                 input_embeddings[-num_new_tokens:] = input_embeddings_avg
                 output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+            # 参数微调梯度控制策略
             if model_args.tune_mm_mlp_adapter:
                 for p in self.get_input_embeddings().parameters():
                     p.requires_grad = True
